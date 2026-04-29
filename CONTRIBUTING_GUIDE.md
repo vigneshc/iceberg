@@ -172,6 +172,146 @@ try (CloseableIterable<FileScanTask> tasks = scan.planFiles()) {
 {"format-version": 2, "table-uuid": "...", "last-updated-ms": 1234}
 ```
 
+### 2.4 Testing Spark Changes End-to-End
+
+#### Unit and extension tests — no Spark cluster needed
+
+Every Spark test in the Iceberg repo uses an **embedded, in-process Spark session** started with `.master("local[2]")`. This runs a two-thread Spark executor inside the JVM of the test process itself. You do **not** need to install Spark, configure YARN/K8s, or run anything outside the `./gradlew` command:
+
+```bash
+# Run a single test method quickly
+./gradlew :iceberg-spark:iceberg-spark-4.1_2.13:test \
+  --tests "org.apache.iceberg.spark.source.TestStructuredStreamingRead3.testReadStreamWithSnapshotTypeAppend"
+
+# Rerun only failed tests (Gradle incremental build will skip passing ones)
+./gradlew :iceberg-spark:iceberg-spark-4.1_2.13:test --rerun-tasks
+
+# Increase heap if tests OOM (default is 3160m, set in build.gradle)
+./gradlew :iceberg-spark:iceberg-spark-4.1_2.13:test -Dorg.gradle.jvmargs="-Xmx6g"
+```
+
+Each parameterized test class runs against **multiple catalog backends** (Hive metastore, Hadoop filesystem, REST, `spark_catalog`) in a single `./gradlew test` invocation. The in-process Hive metastore (`TestHiveMetastore`) starts a real HMS thrift server on a random port inside the JVM. The REST catalog server (`RESTServerExtension`) similarly binds to a free local port. No containers are involved.
+
+To run only a single catalog variant while iterating (the test class uses `@Parameters` so catalog is part of the test name):
+
+```bash
+# The test name format is: testMethod[catalogName = <catalog>, ...]
+./gradlew :iceberg-spark:iceberg-spark-4.1_2.13:test \
+  --tests "*TestStructuredStreamingRead3*" \
+  --info 2>&1 | grep "catalogName"
+# then filter by adding the full parameterized name:
+./gradlew :iceberg-spark:iceberg-spark-4.1_2.13:test \
+  --tests "*TestStructuredStreamingRead3*hadoop*"
+```
+
+#### Manual testing with `spark-shell` / `spark-sql` — no separate Spark install needed
+
+When you want to verify a change interactively (e.g., run a streaming query by hand, inspect snapshot metadata, check SQL output), the workflow is:
+
+**Step 1: Build the shadow/runtime JAR**
+
+```bash
+# Produces: spark/v4.1/spark-runtime/build/libs/iceberg-spark-runtime-4.1_2.12-<version>.jar
+./gradlew :iceberg-spark:iceberg-spark-runtime-4.1_2.12:shadowJar
+```
+
+**Step 2: Download a matching Spark distribution (one-time)**
+
+Download a pre-built Spark 4.1 binary from https://spark.apache.org/downloads.html and unpack it anywhere. You do **not** need to configure HDFS, YARN, or any cluster — just the unpacked `spark-4.1.x-bin-hadoop3/` directory.
+
+**Step 3: Launch `spark-sql` with the local JAR**
+
+```bash
+SPARK_HOME=/path/to/spark-4.1.x-bin-hadoop3
+
+$SPARK_HOME/bin/spark-sql \
+  --master "local[2]" \
+  --jars spark/v4.1/spark-runtime/build/libs/iceberg-spark-runtime-4.1_2.12-*.jar \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+  --conf spark.sql.catalog.local=org.apache.iceberg.spark.SparkCatalog \
+  --conf spark.sql.catalog.local.type=hadoop \
+  --conf spark.sql.catalog.local.warehouse=/tmp/iceberg-warehouse
+```
+
+From the `spark-sql` prompt you can now run:
+
+```sql
+CREATE TABLE local.db.events (id bigint, ts timestamp, data string)
+USING iceberg
+PARTITIONED BY (days(ts));
+
+INSERT INTO local.db.events VALUES (1, now(), 'hello');
+
+SELECT * FROM local.db.events.snapshots;
+SELECT * FROM local.db.events.files;
+```
+
+For a streaming query, use `spark-shell` (Scala REPL):
+
+```bash
+$SPARK_HOME/bin/spark-shell \
+  --master "local[2]" \
+  --jars spark/v4.1/spark-runtime/build/libs/iceberg-spark-runtime-4.1_2.12-*.jar \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+  --conf spark.sql.catalog.local=org.apache.iceberg.spark.SparkCatalog \
+  --conf spark.sql.catalog.local.type=hadoop \
+  --conf spark.sql.catalog.local.warehouse=/tmp/iceberg-warehouse
+```
+
+```scala
+// In the Scala REPL:
+val stream = spark.readStream
+  .format("iceberg")
+  .option("stream-from-timestamp", "0")
+  .load("local.db.events")
+
+val query = stream.writeStream
+  .format("console")
+  .option("checkpointLocation", "/tmp/iceberg-checkpoint")
+  .start()
+
+query.processAllAvailable()
+query.stop()
+```
+
+#### Manual testing with the REST catalog Docker fixture
+
+If you want to test against a REST catalog specifically (e.g., you're working on REST-catalog-specific code paths), there is a pre-built Docker image:
+
+```bash
+# Start the REST catalog server (wraps an in-memory catalog over REST)
+docker run -p 8181:8181 apache/iceberg-rest-fixture
+
+# Then start spark-sql pointing at REST
+$SPARK_HOME/bin/spark-sql \
+  --master "local[2]" \
+  --jars spark/v4.1/spark-runtime/build/libs/iceberg-spark-runtime-4.1_2.12-*.jar \
+  --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+  --conf spark.sql.catalog.rest=org.apache.iceberg.spark.SparkCatalog \
+  --conf spark.sql.catalog.rest.catalog-impl=org.apache.iceberg.rest.RESTCatalog \
+  --conf spark.sql.catalog.rest.uri=http://localhost:8181 \
+  --conf spark.sql.catalog.rest.warehouse=s3://bucket/warehouse
+```
+
+If you've changed the REST server itself, rebuild the fixture image locally first:
+
+```bash
+./gradlew :iceberg-open-api:shadowJar
+docker build -t apache/iceberg-rest-fixture -f docker/iceberg-rest-fixture/Dockerfile .
+```
+
+#### Summary: which mode to use
+
+| Goal | Command |
+|---|---|
+| Normal development — add/fix a test | `./gradlew :iceberg-spark:iceberg-spark-4.1_2.13:test --tests "…YourTest…"` |
+| Verify shading doesn't break anything | `./gradlew :iceberg-spark:iceberg-spark-runtime-4.1_2.13:integrationTest` |
+| Interactive SQL / table inspection | `spark-sql --master local[2] --jars <shadow-jar>` |
+| Interactive streaming query | `spark-shell --master local[2] --jars <shadow-jar>` |
+| Test REST catalog code paths | Docker fixture + `spark-sql` pointing at `localhost:8181` |
+
+No Docker, no cluster, and no separate Spark install are required for the vast majority of development — the unit test suite covers almost everything. The `spark-sql`/`spark-shell` path is most useful when you want to poke at a change interactively or reproduce a user-reported issue with exact SQL.
+
 ---
 
 ## 3. Areas of Deep Interest
